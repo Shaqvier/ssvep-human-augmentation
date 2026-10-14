@@ -17,12 +17,12 @@ Full details (gripper build-from-source, firmware version check, calibration) ar
 
 Pick based on your task, then confirm the firmware/ROS pairing below before flashing or launching anything.
 
-| Task | Current ROS 2 node | Matching firmware | Current classifier |
+| Task | Current ROS 2 node | Matching firmware | Classifier |
 |---|---|---|---|
 | Scan-and-reach, cued trials | `ros2_nodes/scan_and_reach_online_experiment.py` | `firmware/sequence_experiment_cue.ino` | `matlab/classifiers/read_ssvep_ros2_fbcca_banded.m` |
 | Scan-and-reach, verbal cue (no LED cue phase) | `ros2_nodes/scan_and_reach_verbal.py` | `firmware/sequence_experiment.ino` | `matlab/classifiers/read_ssvep_ros2_fbcca_banded.m` |
 | Screwdriver jog | `ros2_nodes/wrist_jog_screwdriver_b.py` | `firmware/SSVEP_Screwdriver_Experiment.ino` | `matlab/classifiers/read_ssvep_ros2_fbcca_banded.m` |
-| Offline-only SSVEP calibration block (no robot) | — | `firmware/SSVEP_Offline_Experiment.ino` | n/a — use `matlab/analysis/ssvep_offline_analysis.m` afterward |
+| Offline-only SSVEP calibration block (no robot) | — | `firmware/SSVEP_Offline_Experiment.ino` | — |
 
 Everything else in `ros2_nodes/` and `firmware/` (the `_table_final`, `_final`, `_demo`, `_demo_last`, `4colorLEDStrip*` files, `read_ssvep_ros2.m`, `read_ssvep_ros2_fbcca.m`) is an earlier iteration kept for reference/comparison, **not** meant to be run as-is. If you do open one, check its header comment for its exact serial protocol and frequency→class mapping — these are **not consistent across variants**.
 
@@ -43,15 +43,7 @@ Everything else in `ros2_nodes/` and `firmware/` (the `_table_final`, `_final`, 
 5. **Verify before trusting any run**: check `ros2 topic echo /ssvep_command` fires when you expect, and watch the classifier's console output for a few seconds of rest/no-stimulus data — scores should sit near the noise floor, not lock onto one class (see troubleshooting below if they don't).
 6. **Stop/reset**: use the kill-all-nodes block in `docs/ros2_commands.txt` rather than Ctrl-C-ing every terminal individually if something hangs.
 
-## 4. Running offline analysis on a recorded session
-
-1. Point `matlab/analysis/plot_run_overview.m` or `batch_plot_recordings.m` at a `recordings/exp*.mat` file (or a folder of them) for a quick first look — spectra, raster, score panels.
-2. For a deeper per-recording diagnostic (SNR, cue-locked average, trigger-coupling check), use `analyze_recording.m`.
-3. For discrete-trial online sessions, use `analyze_discrete_online.m` — **it will prompt you to manually enter the cued class per trial**, since this isn't logged automatically yet (see gotcha below). Have your trial log/notes ready before starting.
-4. For continuous screwdriver-task recordings, use `plot_continuous_recording.m` (per-run review) and `plot_wrist_rotation_groups.m` (box-plot comparison across groups).
-5. For pooled/ITR-level analysis across sessions, use `ssvep_combined_band.m` or `ssvep_offline_analysis.m`.
-
-## 5. Troubleshooting checklist
+## 4. Troubleshooting checklist
 
 Work through these in order if something looks wrong before changing thresholds or code:
 
@@ -63,38 +55,23 @@ Work through these in order if something looks wrong before changing thresholds 
 6. **LSL shows "connected" but no data flows?** That status only confirms UDP multicast discovery, not real TCP data. On multi-homed machines, force unicast to the correct IP via `KnownPeers` in `lsl_api.cfg`.
 7. **Joint faults during continuous jog control?** Make sure joint 7 steps are computed from the *measured* current joint value, not an accumulated target — an accumulator drifts from reality.
 
-## 6. Known limitations / before you trust the data
-
-- **Cue labels aren't recorded automatically** in discrete-trial online `.mat` files — `analyze_discrete_online.m` requires manual entry, so treat online accuracy numbers as dependent on that manual labeling being correct, not independently verifiable from the raw data alone.
-- **Recording filename timestamps are end-of-recording time**, not start — use the `t0u` field inside the `.mat` file for the true start time.
-- **The session recorded 22 July** ran the classifier at ~83 Hz instead of the intended ~3.9 Hz decision rate — exclude it from timing-sensitive analysis.
-- **`wrist_net` marker sign is inverted on rightward-rotation trials** in at least one dataset — recompute net rotation from the unwrapped `wrist_jog` series referenced to the home joint angle (1.57 rad) instead of trusting the stored marker.
-- **The first logged jog target in a trial is already post-step** — reference back to the home angle to recover the true first step size.
-- A stale comment (`JOG_STEP_RAD`) doesn't match its actual value in one jog-node variant — verify constants against runtime behaviour, not comments, before reusing a node.
-- Joint-angle `unwrap()` currently happens only at analysis time, not at logging time — on the backlog to fix. Full backlog: `docs/analysis_notes/writeup_notes_analysis_phase.md`, section 7.
-
 ## Reference
 
 **Repo structure**
 ```
 firmware/           Arduino sketches (LED stimulus + trigger + serial protocol)
 ros2_nodes/         ROS 2 Python nodes (robot control, teach/calibration tools)
-matlab/
-  classifiers/      Live LSL -> ROS 2 classifier scripts (CCA / FBCCA variants)
-  analysis/         Offline analysis, plotting, and batch-processing scripts
-  utils/            Standalone test/support scripts (mock LSL sender, etc.)
+matlab/classifiers/ Live LSL -> ROS 2 classifier scripts (CCA / FBCCA variants)
+matlab/utils/       Standalone test/support scripts (mock LSL sender, etc.)
 config/             YAML configs (scan/delivery poses, AprilTag definitions)
-docs/
-  analysis_notes/   Write-up notes from the analysis phase (methods, stats, backlog)
-  figures/          Key figures (e.g. fig1_overview.png)
-  ros2_commands.txt Terminal-by-terminal command reference for the full ROS 2 stack
+docs/ros2_commands.txt   Terminal-by-terminal command reference for the full ROS 2 stack
 ```
 
-**Hardware/software stack**: BrainVision actiCHamp + 32-ch CACS-32 cap, LSL streaming; MATLAB R2025b + EEGLAB, FBCCA per Chen et al. 2015 (*J. Neural Eng.* 12(4):046008); KINOVA Gen3 7-DOF (`192.168.1.10`) + Robotiq 2F-85, ROS 2 Jazzy / Ubuntu 24.04, `kortex_bringup`, MoveIt 2; AprilTag `tag36h11` via `gscam2` + `apriltag_ros`; Arduino + WS2812B (FastLED).
+**Hardware/software stack**: BrainVision actiCHamp + 32-ch CACS-32 cap, LSL streaming; MATLAB R2025b, FBCCA per Chen et al. 2015 (*J. Neural Eng.* 12(4):046008); KINOVA Gen3 7-DOF (`192.168.1.10`) + Robotiq 2F-85, ROS 2 Jazzy / Ubuntu 24.04, `kortex_bringup`, MoveIt 2; AprilTag `tag36h11` via `gscam2` + `apriltag_ros`; Arduino + WS2812B (FastLED).
 
 **Home joint pose** (most scan-and-reach variants): `[0.0, 0.26, 3.14, -2.27, 0.0, 0.96, 1.57]`. The screwdriver-jog nodes use a nearby but distinct home waypoint — check the specific file rather than assuming.
 
-**Mock data / dry-run without hardware**: `matlab/utils/mock_sender.m` streams a fake EEG LSL source at a chosen SSVEP frequency, so you can exercise the classifier → ROS 2 path without the amplifier.
+**Dry-run without hardware**: `matlab/utils/mock_sender.m` streams a fake EEG LSL source at a chosen SSVEP frequency, so you can exercise the classifier → ROS 2 path without the amplifier.
 
 ## License
 
