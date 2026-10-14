@@ -1,0 +1,10 @@
+/**:
+    ros__parameters:
+        image_transport: raw
+        family: 36h11
+        size: 0.079
+        pose_estimation_method: "pnp"
+        tag:
+            ids: [5]
+            frames: [tag5]
+            sizes: [0.079]

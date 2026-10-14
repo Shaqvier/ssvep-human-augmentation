@@ -1,0 +1,444 @@
+================================================================================
+ROS 2 + Kinova Gen3 + AprilTag — Terminal Commands Reference
+================================================================================
+
+--------------------------------------------------------------------------------
+CRITICAL FIRMWARE REQUIREMENT
+--------------------------------------------------------------------------------
+
+# Kinova arm firmware MUST be 2.5.x or newer for ros2_kortex gripper to work.
+# On firmware 2.4.0 the gripper write path silently fails — commands are sent
+# but the firmware ignores them (gripper_motor_command_->set_position() in
+# LOW_LEVEL_SERVOING mode has no effect on older firmware).
+#
+# Current installed firmware: 2.8.0
+# Check via webapp:  http://192.168.1.10  ->  hamburger menu  ->  System
+# Download latest:   https://www.kinovarobotics.com/resources?r=24&s
+# Upload .swu file via System -> Firmware Update (15-30 min, robot reboots itself)
+
+--------------------------------------------------------------------------------
+ONE-TIME SETUP — GRIPPER (do NOT need to repeat)
+--------------------------------------------------------------------------------
+
+# The Robotiq 2F-85 gripper requires the robotiq_driver hardware interface
+# plugin, which is NOT available via apt. Must be built from source.
+# Also requires the wjwwood/serial library (also not in apt for Jazzy).
+
+# STEP 1 — Install wjwwood/serial library (tylerjw fork, ros2 branch)
+cd ~
+git clone https://github.com/tylerjw/serial.git --branch ros2 serial
+cd serial
+mkdir build && cd build
+cmake ..
+make
+sudo make install
+sudo ldconfig
+
+# STEP 2 — Clone PickNik's ros2_robotiq_gripper into workspace
+cd ~/ros2_ws/src
+git clone https://github.com/PickNikRobotics/ros2_robotiq_gripper.git
+
+# STEP 3 — Build robotiq_driver (skip tests due to linker issue)
+cd ~/ros2_ws
+colcon build --symlink-install --packages-select robotiq_driver --cmake-args -DBUILD_TESTING=OFF
+
+# STEP 4 — Verify plugin registered
+source ~/ros2_ws/install/setup.bash
+ros2 pkg list | grep robotiq
+# Expected output includes: robotiq_driver
+
+# STEP 5 — Custom xacro at:
+# ~/ros2_ws/src/ros2_kortex/kortex_description/grippers/robotiq_2f_85/urdf/robotiq_2f_85_macro.xacro
+# was modified to fix multiple incompatibilities:
+#   - Removed: mock_sensor_commands, isaac_joint_commands, isaac_joint_states
+#     (no longer accepted by system robotiq_description package)
+#   - Renamed: sim_gazebo -> sim_ignition (in inner macro call)
+#   - Added params: use_internal_bus_gripper_comm, moveit_active,
+#                   gripper_joint_name, gripper_max_velocity, gripper_max_force
+#   - Added <xacro:if value="${use_internal_bus_gripper_comm}"> block that
+#     sets effective_ros2_control=false to PREVENT loading RobotiqGripperHardwareInterface
+#     when kortex driver already handles the gripper. Without this conditional,
+#     two hardware interfaces both try to claim robotiq_85_left_knuckle_joint/position
+#     and ros2_control_node segfaults at startup.
+# If kortex_description is rebuilt or re-cloned, this file must be restored.
+
+# STEP 6 — Controller type fix in:
+# ~/ros2_ws/src/ros2_kortex/kortex_description/arms/gen3/7dof/config/ros2_controllers.yaml
+# Controller type MUST be:
+#   robotiq_gripper_controller:
+#     type: position_controllers/GripperActionController   <- plural 'controllers'
+# The default 'parallel_gripper_action_controller/GripperActionController' has a
+# known issue where the controller does not write the goal value to its exported
+# command interface — gripper_command_position_ in the kortex driver stays at the
+# initial value and the goal is never actually transmitted.
+# NOTE: 'position_controller' (singular) is a TYPO — that plugin doesn't exist.
+
+# STEP 7 — Save a backup of the working ros2_kortex tree
+cp -r ~/ros2_ws/src/ros2_kortex ~/ros2_kortex_WORKING_$(date +%Y%m%d)
+
+
+--------------------------------------------------------------------------------
+ENVIRONMENT SETUP (run once per terminal session)
+--------------------------------------------------------------------------------
+
+# Source ROS 2
+source /opt/ros/jazzy/setup.bash
+
+# Source workspace
+source ~/ros2_ws/install/setup.bash
+
+# Remove Anaconda from PATH (required before any colcon build)
+export CPLUS_INCLUDE_PATH=""
+export C_INCLUDE_PATH=""
+export CPATH=""
+export PATH=/usr/bin:/usr/local/bin:/bin:/usr/sbin:/sbin:/opt/ros/jazzy/bin
+export PIP_BREAK_SYSTEM_PACKAGES=1
+
+--------------------------------------------------------------------------------
+LAUNCH SEQUENCE (run in order, one terminal each)
+--------------------------------------------------------------------------------
+
+# Terminal 1 — Arm driver (no RViz) — WITH GRIPPER
+ros2 launch kortex_bringup gen3.launch.py \
+  robot_ip:=192.168.1.10 \
+  launch_rviz:=false \
+  gripper:=robotiq_2f_85
+
+# Terminal 1 (SIMULATION, no robot) — Fake hardware
+ros2 launch kortex_bringup gen3.launch.py robot_ip:=192.168.1.10 use_fake_hardware:=true launch_rviz:=false
+
+# Terminal 2 — MoveIt move_group (wait for "MoveGroup context initialization complete")
+ros2 launch kinova_gen3_7dof_robotiq_2f_85_moveit_config move_group.launch.py
+
+# Terminal 3 — MoveIt RViz
+ros2 launch kinova_gen3_7dof_robotiq_2f_85_moveit_config moveit_rviz.launch.py rviz_config:=~/ros2_ws/moveit_gen3.rviz
+
+# Terminal 4 — Wrist camera stream (with calibration file)
+# CRITICAL: 640x360 resolution MUST match IMG_W/IMG_H in scan_and_reach_final.py
+# Downscaled to 640x360 to reduce bandwidth on shared LAN cable
+# (camera and joint comms share 192.168.1.10 — full 1280x720 causes Network Error faults)
+# If you launch without videoscale, the script's TARGET_CX/CY will be wrong and the
+# robot will "converge" with the tag at the corner of the frame instead of centred.
+# Verify resolution after launch with:
+#   ros2 topic echo /image_raw --once --field width
+ros2 run gscam2 gscam_main --ros-args \
+  -p gscam_config:="rtspsrc location=rtsp://192.168.1.10/color latency=0 ! decodebin ! videoscale ! video/x-raw,width=640,height=360 ! videoconvert ! video/x-raw,format=RGB" \
+  -p camera_name:="wrist_camera" \
+  -p camera_info_url:="file:///home/farrel-xavier/.ros/camera_info/wrist_camera.yaml" \
+  -p use_sensor_data_qos:=true
+
+# Terminal 5 — Sync camera_info timestamps with image_raw
+python3 ~/ros2_ws/sync_camera_info.py
+
+# Terminal 6 — Rectify image for AprilTag
+ros2 run image_proc rectify_node --ros-args \
+  -r image:=/image_raw \
+  -r camera_info:=/camera_info_synced \
+  -r image_rect:=/image_rectified
+
+# Terminal 7 — AprilTag detection (publishes pose on /tf)
+ros2 run apriltag_ros apriltag_node --ros-args \
+  -r image_rect:=/image_rectified \
+  -r camera_info:=/camera_info_synced \
+  --params-file ~/ros2_ws/tags_36h11.yaml
+
+# Terminal 8 — Main robot control (scan + IBVS + auto controller switching)
+python3 ~/ros2_ws/scan_and_reach_final.py
+
+--------------------------------------------------------------------------------
+CONTROLLER SWITCHING (manual, if needed)
+--------------------------------------------------------------------------------
+
+# Switch TO twist controller (for IBVS)
+ros2 service call /controller_manager/switch_controller controller_manager_msgs/srv/SwitchController \
+  "{activate_controllers: ['twist_controller'], deactivate_controllers: ['joint_trajectory_controller'], strictness: 1}"
+
+# Switch BACK to joint trajectory controller (for MoveIt / scanning)
+ros2 service call /controller_manager/switch_controller controller_manager_msgs/srv/SwitchController \
+  "{activate_controllers: ['joint_trajectory_controller'], deactivate_controllers: ['twist_controller'], strictness: 1}"
+
+# Check controller states
+ros2 service call /controller_manager/list_controllers controller_manager_msgs/srv/ListControllers {} | grep -E "name|state"
+
+# NOTE: scan_and_reach_final.py handles controller switching automatically
+# NOTE: twist_controller only available with real hardware (not fake/simulation)
+# NOTE: tcp/twist interfaces only available when robot is physically connected
+
+--------------------------------------------------------------------------------
+GRIPPER COMMANDS (Robotiq 2F-85)
+--------------------------------------------------------------------------------
+
+# Open gripper
+ros2 action send_goal /robotiq_gripper_controller/gripper_cmd control_msgs/action/GripperCommand \
+  "{command:{position: 0.0, max_effort: 100.0}}"
+
+# Close gripper (grasp)
+ros2 action send_goal /robotiq_gripper_controller/gripper_cmd control_msgs/action/GripperCommand \
+  "{command:{position: 0.5, max_effort: 100.0}}"
+
+# Fully closed
+ros2 action send_goal /robotiq_gripper_controller/gripper_cmd control_msgs/action/GripperCommand \
+  "{command:{position: 0.8, max_effort: 100.0}}"
+
+# Verify gripper action server is up
+ros2 action info /robotiq_gripper_controller/gripper_cmd
+# Expected: Action servers: 1 (/robotiq_gripper_controller)
+
+# Verify gripper joint in joint_states
+ros2 topic echo /joint_states --once | grep -A2 robotiq
+
+# NOTE: Position values
+#   0.0     = fully open
+#   0.5     = grasping (value from grabBox.json)
+#   0.8     = fully closed
+#   max_effort: 100.0 is the documented value from ros2_kortex README
+
+--------------------------------------------------------------------------------
+SCAN AND REACH PARAMETERS (~/ros2_ws/scan_and_reach_final.py)
+--------------------------------------------------------------------------------
+
+# State machine: scanning -> switching -> servoing -> done
+# Detection disabled for waypoints 0-2 (wrist not pointing down yet)
+
+# IBVS parameters:
+# TARGET_SIZE = 200 pixels (stopping distance, increase to stop further away)
+# BORDER_MARGIN = 150 pixels (ignore tags near image edges during scan)
+# KP_XY = 0.0002, KP_Z = 0.0003, KP_ROT = 0.15 (control gains)
+# DEAD_XY = 10px, DEAD_Z = 15px, DEAD_ROT = 0.05rad (convergence dead zones)
+# MAX_LIN_VEL = 0.04 m/s, MIN_LIN_VEL = 0.01 m/s (velocity limits)
+# ROT_ENABLE_THRESHOLD = 100px (rotation only corrects when tag near centre)
+
+# Watchdog parameters:
+# VISUAL_STALL_SEC = 5.0s (restart if errors don't change for this long)
+# VISUAL_STALL_CLOSE = 50px (disable visual stall watchdog when this close)
+# HARDWARE_STALL_SEC = 8.0s (must be > scan interval 5s + move time 4s)
+# HARDWARE_STALL_THR = 0.05 rad (min joint movement to count as moving)
+# WATCHDOG_GRACE_SEC = 15.0s (grace period before hardware watchdog activates)
+
+# Verified axis mapping (camera mounted on top of wrist pointing down):
+# Robot +x moves tag RIGHT in image  -> err_x positive = move -x
+# Robot +y moves tag DOWN in image   -> err_y positive = move -y
+# Robot +z moves tag CLOSER          -> err_z negative (too small) = move +z
+# angular.z -> wrist yaw (TEST SIGN DIRECTION IN LAB with tag at 45 deg)
+
+--------------------------------------------------------------------------------
+CALIBRATION — CAMERA INTRINSICS (only needed once, already done)
+--------------------------------------------------------------------------------
+
+# Launch calibrator (8x5 checkerboard, 30mm squares)
+ros2 run camera_calibration cameracalibrator \
+  --size 8x5 \
+  --square 0.03 \
+  --no-service-check \
+  --ros-args -r image:=/image_raw
+
+# After clicking Save and extracting:
+cd /tmp && tar -xvf calibrationdata.tar.gz
+mkdir -p ~/.ros/camera_info
+cp /tmp/ost.yaml ~/.ros/camera_info/wrist_camera.yaml
+
+--------------------------------------------------------------------------------
+CALIBRATION — HAND-EYE (redo if accuracy is poor)
+--------------------------------------------------------------------------------
+
+# Requires: Terminals 1-7 running, AprilTag flat and stationary on table
+# Use 'world' as robot_base_frame (base_link has no TF data)
+
+ros2 launch easy_handeye2 calibrate.launch.py \
+  name:=wrist_camera_calibration \
+  calibration_type:=eye_in_hand \
+  robot_base_frame:=world \
+  robot_effector_frame:=end_effector_link \
+  tracking_base_frame:=camera_frame \
+  tracking_marker_frame:=tag5
+
+# Procedure:
+# 1. Move arm to pose where tag is visible in wrist camera
+# 2. Click "Take Sample"
+# 3. Repeat ~25 times with varied poses
+# 4. Click "Save"
+# Saved to: ~/.ros2/easy_handeye2/calibrations/wrist_camera_calibration.calib
+
+# Tips for better calibration:
+# - Vary WRIST joints (5,6,7) significantly — most important
+# - Tag should appear in all four corners of camera image across samples
+# - Include close (~25cm) and far (~50cm) distances
+# - Let arm fully settle before each sample
+# - Keep tag completely flat and still throughout
+
+# Current calibration (3rd session — best result):
+# translation: x=0.029, y=0.045, z=0.014
+# rotation: x=-0.000, y=0.011, z=0.968, w=0.251
+
+--------------------------------------------------------------------------------
+APRILTAG CONFIG FILE (~/ros2_ws/tags_36h11.yaml)
+--------------------------------------------------------------------------------
+
+/**:
+    ros__parameters:
+        image_transport: raw
+        family: 36h11
+        size: 0.079
+        pose_estimation_method: "pnp"
+        tag:
+            ids: [5]
+            frames: [tag5]
+            sizes: [0.079]
+
+# Note: tag ID and size (in metres, black part only = 79mm) must match printed tag
+
+--------------------------------------------------------------------------------
+TF FRAME NOTES
+--------------------------------------------------------------------------------
+
+# IMPORTANT: Use 'world' frame not 'base_link'
+# base_link exists in TF tree but has buffer_length=0 (no transform data)
+# world->base_link is a static identity transform
+# Correct lookup: ros2 run tf2_ros tf2_echo world end_effector_link
+
+--------------------------------------------------------------------------------
+VERIFICATION COMMANDS
+--------------------------------------------------------------------------------
+
+# Check arm joint states (one-shot — useful for recording poses)
+ros2 topic echo /joint_states --once
+
+# Check available topics
+ros2 topic list
+
+# Check camera topics
+ros2 topic list | grep -E "image|camera"
+
+# Check camera framerate
+ros2 topic hz /image_raw
+
+# Check camera resolution (must be 640 x 360 — matches IMG_W/IMG_H in script)
+ros2 topic echo /image_raw --once --field width
+ros2 topic echo /image_raw --once --field height
+
+# Check AprilTag detections (2D pixel data)
+ros2 topic echo /detections
+
+# Check AprilTag pose in camera frame (via TF)
+ros2 topic echo /tf | grep -A15 "tag5"
+
+# Check end effector pose in world frame
+ros2 run tf2_ros tf2_echo world end_effector_link
+
+# Check TF tree
+ros2 run tf2_tools view_frames
+
+# Check running nodes
+ros2 node list
+
+# Check controller states
+ros2 service call /controller_manager/list_controllers controller_manager_msgs/srv/ListControllers {} | grep -E "name|state"
+
+# Check kortex packages installed
+ros2 pkg list | grep -E "kortex|apriltag|gscam|handeye"
+
+# Validate camera_info is publishing with calibration values
+ros2 topic echo /camera_info --once
+
+# Check available actions
+ros2 action list
+
+# Test IBVS axis mapping (publish fake detection, tag right of centre)
+ros2 topic pub --rate 10 /detections apriltag_msgs/msg/AprilTagDetectionArray "{
+  header: {frame_id: 'camera_frame'},
+  detections: [{
+    family: 'tag36h11', id: 5,
+    centre: {x: 800.0, y: 360.0},
+    corners: [{x: 750.0, y: 310.0}, {x: 850.0, y: 310.0}, {x: 850.0, y: 410.0}, {x: 750.0, y: 410.0}]
+  }]
+}"
+# Expected: linear.x = negative (moves left to centre tag)
+
+--------------------------------------------------------------------------------
+RECORD A JOINT POSE (for scan waypoints or ready poses)
+--------------------------------------------------------------------------------
+
+# Move arm to desired position in MoveIt RViz, then:
+ros2 topic echo /joint_states --once
+# Copy the 7 position values — use as waypoint in scan_and_reach_final.py
+
+--------------------------------------------------------------------------------
+MANUAL ARM CONTROL (without MoveIt)
+--------------------------------------------------------------------------------
+
+# Move joint 1 by 0.3 radians
+ros2 topic pub --once /joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{
+  joint_names: ['joint_1','joint_2','joint_3','joint_4','joint_5','joint_6','joint_7'],
+  points: [{
+    positions: [0.3, 0.26, 3.14, -2.27, 0.0, 0.96, 1.57],
+    time_from_start: {sec: 5}
+  }]
+}"
+
+# Return to home position
+ros2 topic pub --once /joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{
+  joint_names: ['joint_1','joint_2','joint_3','joint_4','joint_5','joint_6','joint_7'],
+  points: [{
+    positions: [0.0, 0.26, 3.14, -2.27, 0.0, 0.96, 1.57],
+    time_from_start: {sec: 5}
+  }]
+}"
+
+--------------------------------------------------------------------------------
+KILL ALL ROS NODES (emergency reset)
+--------------------------------------------------------------------------------
+
+kill -9 $(pgrep -f "robot_state_publisher") 2>/dev/null
+kill -9 $(pgrep -f "move_group") 2>/dev/null
+kill -9 $(pgrep -f "kortex") 2>/dev/null
+kill -9 $(pgrep -f "controller_manager") 2>/dev/null
+kill -9 $(pgrep -f "rviz2") 2>/dev/null
+sleep 3
+ros2 node list  # should return empty
+
+--------------------------------------------------------------------------------
+BUILD COMMANDS
+--------------------------------------------------------------------------------
+
+# Full workspace build (run from ~/ros2_ws, with Anaconda removed from PATH)
+cd ~/ros2_ws
+colcon build --symlink-install
+
+# Build specific packages only
+colcon build --symlink-install --packages-select kortex_description kinova_gen3_7dof_robotiq_2f_85_moveit_config
+
+# Install dependencies
+rosdep install --from-paths src --ignore-src -r -y
+
+--------------------------------------------------------------------------------
+KEY FILE LOCATIONS
+--------------------------------------------------------------------------------
+
+Camera calibration:     ~/.ros/camera_info/wrist_camera.yaml
+Hand-eye calibration:   ~/.ros2/easy_handeye2/calibrations/wrist_camera_calibration.calib
+AprilTag config:        ~/ros2_ws/tags_36h11.yaml
+RViz config:            ~/ros2_ws/moveit_gen3.rviz
+Sync node:              ~/ros2_ws/sync_camera_info.py
+Main control node:      ~/ros2_ws/scan_and_reach_final.py
+IBVS only node:         ~/ros2_ws/ibvs_reach.py
+Tag reach node:         ~/ros2_ws/tag_reach.py
+
+--------------------------------------------------------------------------------
+ROBOT & SYSTEM INFO
+--------------------------------------------------------------------------------
+
+Robot IP:               192.168.1.10
+RTSP stream:            rtsp://192.168.1.10/color
+Home position:          [0.0, 0.26, 3.14, -2.27, 0.0, 0.96, 1.57]
+Downward-facing pose:   [-0.000, 0.379, 3.140, -1.429, -0.001, -1.364, 1.571]
+EEG channels:           P3, Pz, P4, O1, Oz, O2
+Sample rate:            250 Hz
+SSVEP freqs:            8, 10, 12, 15 Hz
+AprilTag family:        36h11
+AprilTag ID:            5 (expand to 4 tags for 4 objects)
+AprilTag size:          0.079m (black part only)
+Camera intrinsics:      fx=1276.75, fy=1271.44, cx=668.77, cy=241.88
+Hand-eye translation:   x=0.029, y=0.045, z=0.014 (ee -> camera, 3rd calibration)
+Hand-eye rotation:      x=-0.000, y=0.011, z=0.968, w=0.251
+
+================================================================================
